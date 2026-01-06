@@ -1,38 +1,117 @@
-# Utiliser une version node légèrement plus récente pour éviter l'avertissement undici
-FROM node:20.18.1
+# Dockerfile-coolify (multistage, ready for Coolify)
+# - Base: installe pnpm + wrangler (évite Corepack fetch/verify issues)
+# - Builder: installe deps, build (avec NODE_OPTIONS augmenté)
+# - Final: image plus légère qui ne contient que le build
 
+############################################
+# Stage: base (outil)
+############################################
+ARG BASE=node:20.18.1
+FROM ${BASE} AS base
+
+# Working dir
 WORKDIR /app
 
-# Installer pnpm et wrangler globalement (contourne corepack)
-# Mettre npm à jour aussi pour éviter warnings
+# Installer outils globaux (évite Corepack signature issues)
+# - npm@latest : prévenir warnings
+# - pnpm : package manager
+# - wrangler : si nécessaire pour les scripts
 RUN npm install -g npm@latest pnpm wrangler
 
-# Créer un répertoire de cache et fixer les permissions (évite EACCES)
+# Préparer cache et permissions (évite EACCES)
 RUN mkdir -p /usr/local/share/.cache && chown -R node:node /usr/local/share/.cache
 
-# Copier seulement les fichiers de dépendances pour profiter du cache Docker
+############################################
+# Stage: builder
+############################################
+FROM base AS builder
+
+# Déclarer les ARGs que Coolify pourrait injecter (liste commune)
+# (Coolify ajoute encore d'autres ARGs au besoin — ceci ne publie aucune valeur)
+ARG GROQ_API_KEY
+ARG HuggingFace_API_KEY
+ARG OPENAI_API_KEY
+ARG ANTHROPIC_API_KEY
+ARG OPEN_ROUTER_API_KEY
+ARG GOOGLE_GENERATIVE_AI_API_KEY
+ARG OLLAMA_API_BASE_URL
+ARG XAI_API_KEY
+ARG TOGETHER_API_KEY
+ARG TOGETHER_API_BASE_URL
+ARG AWS_BEDROCK_CONFIG
+ARG VITE_LOG_LEVEL=debug
+ARG DEFAULT_NUM_CTX
+
+# Rendre ces ARGs disponibles en ENV si nécessaires au build
+ENV WRANGLER_SEND_METRICS=false \
+    GROQ_API_KEY=${GROQ_API_KEY} \
+    HuggingFace_API_KEY=${HuggingFace_API_KEY} \
+    OPENAI_API_KEY=${OPENAI_API_KEY} \
+    ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+    OPEN_ROUTER_API_KEY=${OPEN_ROUTER_API_KEY} \
+    GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY} \
+    OLLAMA_API_BASE_URL=${OLLAMA_API_BASE_URL} \
+    XAI_API_KEY=${XAI_API_KEY} \
+    TOGETHER_API_KEY=${TOGETHER_API_KEY} \
+    TOGETHER_API_BASE_URL=${TOGETHER_API_BASE_URL} \
+    AWS_BEDROCK_CONFIG=${AWS_BEDROCK_CONFIG} \
+    VITE_LOG_LEVEL=${VITE_LOG_LEVEL} \
+    DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX} \
+    RUNNING_IN_DOCKER=true \
+    NODE_ENV=production
+
+# Copier uniquement package.json & lock pour tirer parti du cache Docker
 COPY package.json pnpm-lock.yaml* ./
 
-# Installer les dépendances en mode consistant (frozen lockfile) et verbosé si échec
-# Le fallback relance en mode verbeux pour capturer plus d'infos si ça plante
+# Installer les dépendances (frozen lockfile pour cohérence CI)
+# En cas d'échec, réessayer en mode verbeux pour capter plus d'infos
 RUN pnpm install --frozen-lockfile --reporter=append-only || \
     (echo "pnpm install failed — relaunching in verbose mode" && pnpm install --reporter=ndjson && false)
 
-# Copier le reste du code source
+# Copier le reste du code
 COPY . .
 
-# Si bindings.sh existe, enlever CRLF, rendre exécutable — safe-guard si absent
+# Assurer bindings.sh (si présent) -> CRLF safe + exécutable
 RUN if [ -f bindings.sh ]; then tr -d '\r' < bindings.sh > bindings.tmp && mv bindings.tmp bindings.sh && chmod +x bindings.sh; fi
 
-# Build de l'application
-RUN pnpm run build
+# Augmenter le heap V8 pour éviter OOM durant le build (ajuste selon RAM du runner)
+# Par défaut ici 4GB (4096). Si ton runner a >=8GB, change à 8192.
+ARG NODE_MAX_OLD_SPACE=4096
+ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE}"
 
-# Exposer le port
+# Options de build pour alléger (désactiver sourcemaps si possible)
+ENV VITE_SOURCEMAP=false
+ENV GENERATE_SOURCEMAP=false
+ENV CI=true
+
+# Build (fallback verbeux si échec)
+RUN NODE_OPTIONS="${NODE_OPTIONS}" pnpm run build || \
+    (echo "Build failed — rerunning with debug flags" && NODE_OPTIONS="${NODE_OPTIONS}" pnpm run build -- --debug && false)
+
+############################################
+# Stage: final (runtime)
+############################################
+FROM node:20.18.1 AS production
+
+WORKDIR /app
+
+# Copy only the runtime artifacts from builder
+# (assume build output in ./build or ./public or ./.vercel/output depending on project)
+# Adjust the source dest paths below to match your project (ex: /app/build, /app/public, ./.output)
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/package.json ./package.json
+# Optionally copy any server files if project runs node server
+COPY --from=builder /app/server ./server || true
+
+# Install only production deps if necessary (optional)
+# RUN npm ci --omit=dev
+
+# Expose standard port used by the app
 EXPOSE 5173
 
-# Variables d'env par défaut
-ENV NODE_ENV=production \
-    RUNNING_IN_DOCKER=true
+# Default envs
+ENV NODE_ENV=production RUNNING_IN_DOCKER=true
 
-# Commande de démarrage
+# Command to start (use your dockerstart / start script)
 CMD ["pnpm", "run", "dockerstart"]
