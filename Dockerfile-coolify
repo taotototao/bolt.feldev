@@ -1,33 +1,29 @@
-# Dockerfile-coolify (multistage, ready for Coolify)
-# - Base: installe pnpm + wrangler (évite Corepack fetch/verify issues)
-# - Builder: installe deps, build (avec NODE_OPTIONS augmenté)
-# - Final: image plus légère qui ne contient que le build
-
-############################################
-# Stage: base (outil)
-############################################
+# Basé sur ton Dockerfile fonctionnel — avec NODE_OPTIONS pour éviter OOM
 ARG BASE=node:20.18.1
 FROM ${BASE} AS base
 
-# Working dir
 WORKDIR /app
 
-# Installer outils globaux (évite Corepack signature issues)
-# - npm@latest : prévenir warnings
-# - pnpm : package manager
-# - wrangler : si nécessaire pour les scripts
-RUN npm install -g npm@latest pnpm wrangler
+# Copier package + lock
+COPY package.json pnpm-lock.yaml* ./
 
-# Préparer cache et permissions (évite EACCES)
-RUN mkdir -p /usr/local/share/.cache && chown -R node:node /usr/local/share/.cache
+# Utiliser corepack comme dans ton Dockerfile fonctionnel
+RUN npm install -g corepack@latest
+RUN corepack enable pnpm && pnpm install
 
-############################################
-# Stage: builder
-############################################
-FROM base AS builder
+# Copier le reste du code
+COPY . .
 
-# Déclarer les ARGs que Coolify pourrait injecter (liste commune)
-# (Coolify ajoute encore d'autres ARGs au besoin — ceci ne publie aucune valeur)
+# Préparer bindings.sh si présent
+RUN if [ -f bindings.sh ]; then tr -d '\r' < bindings.sh > bindings.tmp && mv bindings.tmp bindings.sh && chmod +x bindings.sh; fi
+
+# Expose (pré-build stage)
+EXPOSE 5173
+
+# Production image — hérite des node_modules et du code (même comportement que ton Dockerfile qui fonctionne)
+FROM base AS bolt-ai-production
+
+# Build args (déclare ceux que Coolify fournit)
 ARG GROQ_API_KEY
 ARG HuggingFace_API_KEY
 ARG OPENAI_API_KEY
@@ -42,9 +38,46 @@ ARG AWS_BEDROCK_CONFIG
 ARG VITE_LOG_LEVEL=debug
 ARG DEFAULT_NUM_CTX
 
-# Rendre ces ARGs disponibles en ENV si nécessaires au build
 ENV WRANGLER_SEND_METRICS=false \
     GROQ_API_KEY=${GROQ_API_KEY} \
+    HuggingFace_KEY=${HuggingFace_API_KEY} \
+    OPENAI_API_KEY=${OPENAI_API_KEY} \
+    ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+    OPEN_ROUTER_API_KEY=${OPEN_ROUTER_API_KEY} \
+    GOOGLE_GENERATIVE_AI_API_KEY=${GOOGLE_GENERATIVE_AI_API_KEY} \
+    OLLAMA_API_BASE_URL=${OLLAMA_API_BASE_URL} \
+    XAI_API_KEY=${XAI_API_KEY} \
+    TOGETHER_API_KEY=${TOGETHER_API_KEY} \
+    TOGETHER_API_BASE_URL=${TOGETHER_API_BASE_URL} \
+    AWS_BEDROCK_CONFIG=${AWS_BEDROCK_CONFIG} \
+    VITE_LOG_LEVEL=${VITE_LOG_LEVEL} \
+    DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX} \
+    RUNNING_IN_DOCKER=true
+
+# Pré-config wrangler
+RUN mkdir -p /root/.config/.wrangler && echo '{"enabled":false}' > /root/.config/.wrangler/metrics.json
+
+# Augmenter la mémoire V8 pour le build (défaut 8192 MB)
+ARG NODE_MAX_OLD_SPACE=4096
+ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE}"
+
+# Optionnel : alléger sourcemaps (selon config de ton projet)
+ENV VITE_SOURCEMAP=false
+ENV GENERATE_SOURCEMAP=false
+ENV CI=true
+
+# Build (comme dans ton Dockerfile fonctionnel, mais avec plus de heap)
+RUN NODE_OPTIONS="${NODE_OPTIONS}" pnpm run build
+
+CMD [ "pnpm", "run", "dockerstart" ]
+
+# Développement (hérite aussi du base)
+FROM base AS bolt-ai-development
+
+ARG VITE_LOG_LEVEL=debug
+ARG DEFAULT_NUM_CTX
+
+ENV GROQ_API_KEY=${GROQ_API_KEY} \
     HuggingFace_API_KEY=${HuggingFace_API_KEY} \
     OPENAI_API_KEY=${OPENAI_API_KEY} \
     ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
@@ -57,61 +90,7 @@ ENV WRANGLER_SEND_METRICS=false \
     AWS_BEDROCK_CONFIG=${AWS_BEDROCK_CONFIG} \
     VITE_LOG_LEVEL=${VITE_LOG_LEVEL} \
     DEFAULT_NUM_CTX=${DEFAULT_NUM_CTX} \
-    RUNNING_IN_DOCKER=true \
-    NODE_ENV=production
+    RUNNING_IN_DOCKER=true
 
-# Copier uniquement package.json & lock pour tirer parti du cache Docker
-COPY package.json pnpm-lock.yaml* ./
-
-# Installer les dépendances (frozen lockfile pour cohérence CI)
-# En cas d'échec, réessayer en mode verbeux pour capter plus d'infos
-RUN pnpm install --frozen-lockfile --reporter=append-only || \
-    (echo "pnpm install failed — relaunching in verbose mode" && pnpm install --reporter=ndjson && false)
-
-# Copier le reste du code
-COPY . .
-
-# Assurer bindings.sh (si présent) -> CRLF safe + exécutable
-RUN if [ -f bindings.sh ]; then tr -d '\r' < bindings.sh > bindings.tmp && mv bindings.tmp bindings.sh && chmod +x bindings.sh; fi
-
-# Augmenter le heap V8 pour éviter OOM durant le build (ajuste selon RAM du runner)
-# Par défaut ici 4GB (4096). Si ton runner a >=8GB, change à 8192.
-ARG NODE_MAX_OLD_SPACE=4096
-ENV NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE}"
-
-# Options de build pour alléger (désactiver sourcemaps si possible)
-ENV VITE_SOURCEMAP=false
-ENV GENERATE_SOURCEMAP=false
-ENV CI=true
-
-# Build (fallback verbeux si échec)
-RUN NODE_OPTIONS="${NODE_OPTIONS}" pnpm run build || \
-    (echo "Build failed — rerunning with debug flags" && NODE_OPTIONS="${NODE_OPTIONS}" pnpm run build -- --debug && false)
-
-############################################
-# Stage: final (runtime)
-############################################
-FROM node:20.18.1 AS production
-
-WORKDIR /app
-
-# Copy only the runtime artifacts from builder
-# (assume build output in ./build or ./public or ./.vercel/output depending on project)
-# Adjust the source dest paths below to match your project (ex: /app/build, /app/public, ./.output)
-COPY --from=builder /app/build ./build
-COPY --from=builder /app/public ./public
-COPY --from=builder /app/package.json ./package.json
-# Optionally copy any server files if project runs node server
-COPY --from=builder /app/server ./server || true
-
-# Install only production deps if necessary (optional)
-# RUN npm ci --omit=dev
-
-# Expose standard port used by the app
-EXPOSE 5173
-
-# Default envs
-ENV NODE_ENV=production RUNNING_IN_DOCKER=true
-
-# Command to start (use your dockerstart / start script)
-CMD ["pnpm", "run", "dockerstart"]
+RUN mkdir -p ${WORKDIR}/run
+CMD pnpm run dev --host
