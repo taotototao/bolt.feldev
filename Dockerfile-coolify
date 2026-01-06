@@ -1,35 +1,38 @@
-FROM node:20.18.0
+# Utiliser une version node légèrement plus récente pour éviter l'avertissement undici
+FROM node:20.18.1
 
 WORKDIR /app
 
-# Instalar pnpm e wrangler
-RUN npm install -g pnpm
-RUN corepack enable pnpm && \
-    npm install -g wrangler
+# Installer pnpm et wrangler globalement (contourne corepack)
+# Mettre npm à jour aussi pour éviter warnings
+RUN npm install -g npm@latest pnpm wrangler
 
-# Copiar arquivos de dependências
-COPY package.json pnpm-lock.yaml ./
+# Créer un répertoire de cache et fixer les permissions (évite EACCES)
+RUN mkdir -p /usr/local/share/.cache && chown -R node:node /usr/local/share/.cache
 
-# Instalar dependências
-RUN pnpm install
+# Copier seulement les fichiers de dépendances pour profiter du cache Docker
+COPY package.json pnpm-lock.yaml* ./
 
-# Copiar código  fonte e scripts
+# Installer les dépendances en mode consistant (frozen lockfile) et verbosé si échec
+# Le fallback relance en mode verbeux pour capturer plus d'infos si ça plante
+RUN pnpm install --frozen-lockfile --reporter=append-only || \
+    (echo "pnpm install failed — relaunching in verbose mode" && pnpm install --reporter=ndjson && false)
+
+# Copier le reste du code source
 COPY . .
 
-# Garantir que o bindings.sh tem permissões de execução e formato correto
-RUN tr -d '\r' < bindings.sh > bindings.tmp && \
-    mv bindings.tmp bindings.sh && \
-    chmod +x bindings.sh
+# Si bindings.sh existe, enlever CRLF, rendre exécutable — safe-guard si absent
+RUN if [ -f bindings.sh ]; then tr -d '\r' < bindings.sh > bindings.tmp && mv bindings.tmp bindings.sh && chmod +x bindings.sh; fi
 
-# Build da aplicação
+# Build de l'application
 RUN pnpm run build
 
-# Expor porta
+# Exposer le port
 EXPOSE 5173
 
-# Configurar variáveis de ambiente
+# Variables d'env par défaut
 ENV NODE_ENV=production \
     RUNNING_IN_DOCKER=true
 
-# Comando para iniciar usando o script dockerstart
+# Commande de démarrage
 CMD ["pnpm", "run", "dockerstart"]
